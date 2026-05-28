@@ -2,19 +2,49 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// ── In-memory store ──────────────────────────────────────────────
-let users    = {};   // { id: { password, name } }
-let sessions = {};   // { token: userId }
-let sheets   = {};   // { sheetId: { name, games:[{id,home,away}], open, results:{gameId:{home,away}} } }
-let guesses  = {};   // { sheetId: { userId: { gameId: {home,away}, submitted } } }
-let scores   = {};   // { userId: totalPoints }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin1234';
+
+// ── Init tables ───────────────────────────────────────────────────
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      password TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS sheets (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      games JSONB NOT NULL DEFAULT '[]',
+      open BOOLEAN DEFAULT TRUE,
+      results JSONB NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS guesses (
+      sheet_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}',
+      submitted BOOLEAN DEFAULT FALSE,
+      PRIMARY KEY (sheet_id, user_id)
+    );
+  `);
+  console.log('DB ready');
+}
 
 // ── Helpers ───────────────────────────────────────────────────────
 function token() { return crypto.randomBytes(16).toString('hex'); }
@@ -24,237 +54,245 @@ function calcPoints(guess, result) {
   const gH = parseInt(guess.home), gA = parseInt(guess.away);
   const rH = parseInt(result.home), rA = parseInt(result.away);
   if (gH === rH && gA === rA) return 3;
-  const gWin = gH > gA ? 'H' : gH < gA ? 'A' : 'D';
-  const rWin = rH > rA ? 'H' : rH < rA ? 'A' : 'D';
-  if (gWin === rWin) return 1;
-  return 0;
+  const gW = gH > gA ? 'H' : gH < gA ? 'A' : 'D';
+  const rW = rH > rA ? 'H' : rH < rA ? 'A' : 'D';
+  return gW === rW ? 1 : 0;
 }
 
-function recalcAll() {
-  scores = {};
-  for (const [sheetId, sheet] of Object.entries(sheets)) {
-    if (!sheet.results) continue;
-    for (const [userId, userGuesses] of Object.entries(guesses[sheetId] || {})) {
-      if (!userGuesses.submitted) continue;
-      if (!scores[userId]) scores[userId] = 0;
-      for (const [gameId, result] of Object.entries(sheet.results)) {
-        scores[userId] += calcPoints(userGuesses[gameId], result);
-      }
+async function getUserScore(userId) {
+  const sheets = await pool.query('SELECT id, games, results FROM sheets');
+  let total = 0;
+  for (const sheet of sheets.rows) {
+    if (!sheet.results || !Object.keys(sheet.results).length) continue;
+    const g = await pool.query('SELECT data FROM guesses WHERE sheet_id=$1 AND user_id=$2 AND submitted=TRUE', [sheet.id, userId]);
+    if (!g.rows.length) continue;
+    const guessData = g.rows[0].data;
+    for (const [gameId, result] of Object.entries(sheet.results)) {
+      total += calcPoints(guessData[gameId], result);
     }
   }
+  return total;
 }
 
-function getLeaderboard() {
-  return Object.entries(scores)
-    .map(([uid, pts]) => ({ id: uid, name: users[uid]?.name || uid, points: pts }))
-    .sort((a, b) => b.points - a.points)
-    .slice(0, 3);
+async function getLeaderboard(limit = 3) {
+  const users = await pool.query('SELECT id, name FROM users');
+  const scores = await Promise.all(users.rows.map(async u => ({
+    id: u.id, name: u.name, points: await getUserScore(u.id)
+  })));
+  return scores.sort((a, b) => b.points - a.points).slice(0, limit);
 }
 
-// ── Auth ──────────────────────────────────────────────────────────
-app.post('/admin/login', (req, res) => {
-  const { password } = req.body;
-  if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
-  const t = token();
-  sessions[t] = '__admin__';
-  res.json({ token: t });
-});
-
-app.post('/login', (req, res) => {
-  const { id, password } = req.body;
-  const user = users[id];
-  if (!user || user.password !== password) return res.status(401).json({ error: 'Wrong ID or password' });
-  const t = token();
-  sessions[t] = id;
-  res.json({ token: t, name: user.name });
-});
-
-function authUser(req, res) {
+// ── Auth middleware ───────────────────────────────────────────────
+async function authUser(req, res) {
   const t = req.headers['x-token'];
-  const uid = sessions[t];
-  if (!uid || uid === '__admin__') { res.status(401).json({ error: 'Unauthorized' }); return null; }
-  return uid;
+  const r = await pool.query('SELECT user_id FROM sessions WHERE token=$1', [t]);
+  if (!r.rows.length || r.rows[0].user_id === '__admin__') { res.status(401).json({ error: 'Unauthorized' }); return null; }
+  return r.rows[0].user_id;
 }
 
-function authAdmin(req, res) {
+async function authAdmin(req, res) {
   const t = req.headers['x-token'];
-  if (sessions[t] !== '__admin__') { res.status(401).json({ error: 'Unauthorized' }); return false; }
+  const r = await pool.query('SELECT user_id FROM sessions WHERE token=$1', [t]);
+  if (!r.rows.length || r.rows[0].user_id !== '__admin__') { res.status(401).json({ error: 'Unauthorized' }); return false; }
   return true;
 }
 
-// ── Public ────────────────────────────────────────────────────────
-app.get('/leaderboard', (req, res) => {
-  res.json(getLeaderboard());
+// ── Auth routes ───────────────────────────────────────────────────
+app.post('/admin/login', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
+  const t = token();
+  await pool.query('INSERT INTO sessions(token, user_id) VALUES($1,$2)', [t, '__admin__']);
+  res.json({ token: t });
 });
 
-// ── User routes ───────────────────────────────────────────────────
-app.get('/sheets', (req, res) => {
-  const uid = authUser(req, res); if (!uid) return;
-  const list = Object.entries(sheets).map(([id, s]) => ({
-    id, name: s.name, open: s.open, gameCount: s.games.length,
-    submitted: !!(guesses[id]?.[uid]?.submitted),
-    hasResults: Object.keys(s.results || {}).length > 0
-  }));
-  res.json(list);
+app.post('/login', async (req, res) => {
+  const { id, password } = req.body;
+  const r = await pool.query('SELECT * FROM users WHERE id=$1', [id]);
+  if (!r.rows.length || r.rows[0].password !== password) return res.status(401).json({ error: 'Wrong ID or password' });
+  const t = token();
+  await pool.query('INSERT INTO sessions(token, user_id) VALUES($1,$2)', [t, id]);
+  res.json({ token: t, name: r.rows[0].name });
 });
 
-app.get('/sheet/:id', (req, res) => {
-  const uid = authUser(req, res); if (!uid) return;
-  const sheet = sheets[req.params.id];
-  if (!sheet) return res.status(404).json({ error: 'Not found' });
-  const myGuess = guesses[req.params.id]?.[uid] || {};
-  res.json({ ...sheet, myGuess });
+// ── Public routes ─────────────────────────────────────────────────
+app.get('/leaderboard', async (req, res) => {
+  res.json(await getLeaderboard(3));
 });
 
-app.post('/sheet/:id/guess', (req, res) => {
-  const uid = authUser(req, res); if (!uid) return;
-  const sid = req.params.id;
-  const sheet = sheets[sid];
-  if (!sheet) return res.status(404).json({ error: 'Not found' });
-  if (!sheet.open) return res.status(400).json({ error: 'Sheet is closed' });
-  if (guesses[sid]?.[uid]?.submitted) return res.status(400).json({ error: 'Already submitted' });
-  const { gameGuesses } = req.body;
-  if (!guesses[sid]) guesses[sid] = {};
-  guesses[sid][uid] = { ...gameGuesses, submitted: true };
-  recalcAll();
-  res.json({ ok: true });
-});
-
-app.get('/sheet/:id/results', (req, res) => {
-  const uid = authUser(req, res); if (!uid) return;
-  const sid = req.params.id;
-  const sheet = sheets[sid];
-  if (!sheet || !sheet.results) return res.status(404).json({ error: 'No results yet' });
-  const myGuess = guesses[sid]?.[uid] || {};
-  const breakdown = sheet.games.map(g => {
-    const result = sheet.results[g.id];
-    const guess = myGuess[g.id];
-    const pts = calcPoints(guess, result);
-    return { game: g, guess, result, points: pts };
-  });
-  const total = breakdown.reduce((s, r) => s + r.points, 0);
-  res.json({ breakdown, total });
-});
-
-// ── Admin routes ──────────────────────────────────────────────────
-app.get('/admin/users', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  res.json(Object.entries(users).map(([id, u]) => ({ id, name: u.name })));
-});
-
-app.post('/admin/user', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const { id, password, name } = req.body;
-  if (users[id]) return res.status(400).json({ error: 'ID already exists' });
-  users[id] = { password, name };
-  res.json({ ok: true });
-});
-
-app.delete('/admin/user/:id', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  delete users[req.params.id];
-  res.json({ ok: true });
-});
-
-app.get('/admin/sheets', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  res.json(Object.entries(sheets).map(([id, s]) => ({
-    id, name: s.name, open: s.open,
-    gameCount: s.games.length,
-    hasResults: Object.keys(s.results || {}).length > 0
-  })));
-});
-
-app.post('/admin/sheet', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const { name, games } = req.body;
-  const id = 'sheet_' + Date.now();
-  sheets[id] = { name, games, open: true, results: {} };
-  guesses[id] = {};
-  res.json({ id });
-});
-
-app.post('/admin/sheet/:id/close', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  if (sheets[req.params.id]) sheets[req.params.id].open = false;
-  res.json({ ok: true });
-});
-
-app.post('/admin/sheet/:id/open', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  if (sheets[req.params.id]) sheets[req.params.id].open = true;
-  res.json({ ok: true });
-});
-
-app.delete('/admin/sheet/:id', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  delete sheets[req.params.id];
-  delete guesses[req.params.id];
-  recalcAll();
-  res.json({ ok: true });
-});
-
-app.post('/admin/sheet/:id/results', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const { results } = req.body; // { gameId: {home, away} }
-  if (!sheets[req.params.id]) return res.status(404).json({ error: 'Not found' });
-  sheets[req.params.id].results = results;
-  recalcAll();
-  res.json({ ok: true });
-});
-
-app.get('/admin/sheet/:id/guesses', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const sid = req.params.id;
-  const sheet = sheets[sid];
-  if (!sheet) return res.status(404).json({ error: 'Not found' });
-  const out = Object.entries(guesses[sid] || {}).map(([uid, g]) => ({
-    userId: uid, name: users[uid]?.name || uid,
-    submitted: g.submitted,
-    guesses: sheet.games.reduce((acc, game) => {
-      acc[game.id] = g[game.id] || null; return acc;
-    }, {})
-  }));
-  res.json({ sheet, participants: out });
-});
-
-app.delete('/admin/sheet/:id/guess/:userId', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const { id, userId } = req.params;
-  if (guesses[id]) delete guesses[id][userId];
-  recalcAll();
-  res.json({ ok: true });
-});
-
-app.get('/admin/leaderboard', (req, res) => {
-  if (!authAdmin(req, res)) return;
-  const all = Object.entries(scores)
-    .map(([uid, pts]) => ({ id: uid, name: users[uid]?.name || uid, points: pts }))
-    .sort((a, b) => b.points - a.points);
-  res.json(all);
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Quiniela server running on port ${PORT}`));
-
-// ── Public standings (full leaderboard with picks) ────────────────
-app.get('/standings', (req, res) => {
-  const allUsers = Object.entries(users).map(([uid, u]) => {
-    const pts = scores[uid] || 0;
+app.get('/standings', async (req, res) => {
+  const users = await pool.query('SELECT id, name FROM users');
+  const result = await Promise.all(users.rows.map(async u => {
+    const pts = await getUserScore(u.id);
+    const sheets = await pool.query('SELECT id, name, games, results FROM sheets');
     const userSheets = {};
-    for (const [sheetId, sheet] of Object.entries(sheets)) {
-      const g = guesses[sheetId]?.[uid];
-      if (!g || !g.submitted) continue;
-      userSheets[sheetId] = {
+    for (const sheet of sheets.rows) {
+      const g = await pool.query('SELECT data FROM guesses WHERE sheet_id=$1 AND user_id=$2 AND submitted=TRUE', [sheet.id, u.id]);
+      if (!g.rows.length) continue;
+      const guessData = g.rows[0].data;
+      userSheets[sheet.id] = {
         sheetName: sheet.name,
         games: sheet.games.map(game => ({
           home: game.home, away: game.away,
-          guess: g[game.id] || null,
+          guess: guessData[game.id] || null,
           result: sheet.results?.[game.id] || null
         }))
       };
     }
-    return { id: uid, name: u.name, points: pts, sheets: userSheets };
-  }).sort((a, b) => b.points - a.points);
-  res.json(allUsers);
+    return { id: u.id, name: u.name, points: pts, sheets: userSheets };
+  }));
+  res.json(result.sort((a, b) => b.points - a.points));
 });
+
+// ── User routes ───────────────────────────────────────────────────
+app.get('/sheets', async (req, res) => {
+  const uid = await authUser(req, res); if (!uid) return;
+  const sheets = await pool.query('SELECT * FROM sheets ORDER BY id');
+  const result = await Promise.all(sheets.rows.map(async s => {
+    const g = await pool.query('SELECT submitted FROM guesses WHERE sheet_id=$1 AND user_id=$2', [s.id, uid]);
+    return {
+      id: s.id, name: s.name, open: s.open,
+      gameCount: s.games.length,
+      submitted: g.rows.length > 0 && g.rows[0].submitted,
+      hasResults: s.results && Object.keys(s.results).length > 0
+    };
+  }));
+  res.json(result);
+});
+
+app.get('/sheet/:id', async (req, res) => {
+  const uid = await authUser(req, res); if (!uid) return;
+  const r = await pool.query('SELECT * FROM sheets WHERE id=$1', [req.params.id]);
+  if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+  const sheet = r.rows[0];
+  const g = await pool.query('SELECT data FROM guesses WHERE sheet_id=$1 AND user_id=$2', [req.params.id, uid]);
+  res.json({ ...sheet, myGuess: g.rows[0]?.data || {} });
+});
+
+app.post('/sheet/:id/guess', async (req, res) => {
+  const uid = await authUser(req, res); if (!uid) return;
+  const sid = req.params.id;
+  const r = await pool.query('SELECT open FROM sheets WHERE id=$1', [sid]);
+  if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+  if (!r.rows[0].open) return res.status(400).json({ error: 'Sheet is closed' });
+  const existing = await pool.query('SELECT submitted FROM guesses WHERE sheet_id=$1 AND user_id=$2', [sid, uid]);
+  if (existing.rows.length && existing.rows[0].submitted) return res.status(400).json({ error: 'Already submitted' });
+  await pool.query(
+    'INSERT INTO guesses(sheet_id, user_id, data, submitted) VALUES($1,$2,$3,TRUE) ON CONFLICT(sheet_id,user_id) DO UPDATE SET data=$3, submitted=TRUE',
+    [sid, uid, JSON.stringify(req.body.gameGuesses)]
+  );
+  res.json({ ok: true });
+});
+
+app.get('/sheet/:id/results', async (req, res) => {
+  const uid = await authUser(req, res); if (!uid) return;
+  const sid = req.params.id;
+  const r = await pool.query('SELECT * FROM sheets WHERE id=$1', [sid]);
+  if (!r.rows.length || !Object.keys(r.rows[0].results || {}).length) return res.status(404).json({ error: 'No results yet' });
+  const sheet = r.rows[0];
+  const g = await pool.query('SELECT data FROM guesses WHERE sheet_id=$1 AND user_id=$2', [sid, uid]);
+  const myGuess = g.rows[0]?.data || {};
+  const breakdown = sheet.games.map(game => {
+    const result = sheet.results[game.id];
+    const guess = myGuess[game.id];
+    return { game, guess, result, points: calcPoints(guess, result) };
+  });
+  res.json({ breakdown, total: breakdown.reduce((s, r) => s + r.points, 0) });
+});
+
+// ── Admin routes ──────────────────────────────────────────────────
+app.get('/admin/users', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const r = await pool.query('SELECT id, name FROM users ORDER BY name');
+  res.json(r.rows);
+});
+
+app.post('/admin/user', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const { id, password, name } = req.body;
+  try {
+    await pool.query('INSERT INTO users(id, name, password) VALUES($1,$2,$3)', [id, name, password]);
+    res.json({ ok: true });
+  } catch(e) { res.status(400).json({ error: 'ID already exists' }); }
+});
+
+app.delete('/admin/user/:id', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.get('/admin/sheets', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const r = await pool.query('SELECT * FROM sheets ORDER BY id');
+  res.json(r.rows.map(s => ({
+    id: s.id, name: s.name, open: s.open,
+    gameCount: s.games.length,
+    hasResults: s.results && Object.keys(s.results).length > 0
+  })));
+});
+
+app.post('/admin/sheet', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const { name, games } = req.body;
+  const id = 'sheet_' + Date.now();
+  await pool.query('INSERT INTO sheets(id, name, games, open, results) VALUES($1,$2,$3,TRUE,$4)',
+    [id, name, JSON.stringify(games), '{}']);
+  res.json({ id });
+});
+
+app.post('/admin/sheet/:id/close', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('UPDATE sheets SET open=FALSE WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.post('/admin/sheet/:id/open', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('UPDATE sheets SET open=TRUE WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.delete('/admin/sheet/:id', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('DELETE FROM guesses WHERE sheet_id=$1', [req.params.id]);
+  await pool.query('DELETE FROM sheets WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.post('/admin/sheet/:id/results', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('UPDATE sheets SET results=$1 WHERE id=$2', [JSON.stringify(req.body.results), req.params.id]);
+  res.json({ ok: true });
+});
+
+app.get('/admin/sheet/:id/guesses', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const sid = req.params.id;
+  const sheet = await pool.query('SELECT * FROM sheets WHERE id=$1', [sid]);
+  if (!sheet.rows.length) return res.status(404).json({ error: 'Not found' });
+  const s = sheet.rows[0];
+  const allGuesses = await pool.query('SELECT g.user_id, g.data, g.submitted, u.name FROM guesses g JOIN users u ON u.id=g.user_id WHERE g.sheet_id=$1', [sid]);
+  const participants = allGuesses.rows.map(g => ({
+    userId: g.user_id, name: g.name, submitted: g.submitted,
+    guesses: s.games.reduce((acc, game) => { acc[game.id] = g.data[game.id] || null; return acc; }, {})
+  }));
+  res.json({ sheet: s, participants });
+});
+
+app.delete('/admin/sheet/:id/guess/:userId', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  await pool.query('DELETE FROM guesses WHERE sheet_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
+  res.json({ ok: true });
+});
+
+app.get('/admin/leaderboard', async (req, res) => {
+  if (!await authAdmin(req, res)) return;
+  const users = await pool.query('SELECT id, name FROM users');
+  const scores = await Promise.all(users.rows.map(async u => ({
+    id: u.id, name: u.name, points: await getUserScore(u.id)
+  })));
+  res.json(scores.sort((a, b) => b.points - a.points));
+});
+
+const PORT = process.env.PORT || 3000;
+initDB().then(() => app.listen(PORT, () => console.log(`Server on port ${PORT}`)));
