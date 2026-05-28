@@ -236,3 +236,25 @@ app.get('/admin/leaderboard', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Quiniela server running on port ${PORT}`));
+
+// ── Public standings (full leaderboard with picks) ────────────────
+app.get('/standings', (req, res) => {
+  const allUsers = Object.entries(users).map(([uid, u]) => {
+    const pts = scores[uid] || 0;
+    const userSheets = {};
+    for (const [sheetId, sheet] of Object.entries(sheets)) {
+      const g = guesses[sheetId]?.[uid];
+      if (!g || !g.submitted) continue;
+      userSheets[sheetId] = {
+        sheetName: sheet.name,
+        games: sheet.games.map(game => ({
+          home: game.home, away: game.away,
+          guess: g[game.id] || null,
+          result: sheet.results?.[game.id] || null
+        }))
+      };
+    }
+    return { id: uid, name: u.name, points: pts, sheets: userSheets };
+  }).sort((a, b) => b.points - a.points);
+  res.json(allUsers);
+});
